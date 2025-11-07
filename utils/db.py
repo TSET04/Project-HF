@@ -5,7 +5,6 @@ import json
 import mysql.connector
 import numpy as np
 import yfinance as yf
-from pytrends.request import TrendReq
 import time
 from textblob import TextBlob
 import traceback
@@ -362,6 +361,7 @@ class DatabaseHandler:
             return []
         finally:
             cursor.close()
+    
 
     def get_mmi_for_topic(self, symbol):
         logging.info(f'Fetching MMI for topic: {symbol}')

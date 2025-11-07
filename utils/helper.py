@@ -4,6 +4,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import hashlib
 import logging
+from transformers import pipeline
 
 class helper:
     def __init__(self):
@@ -113,12 +114,10 @@ class helper:
         This prevents reloading on every Streamlit rerun.
         """
         try:
-            from transformers import pipeline
             logging.info("Loading FinBERT model...")
             model = pipeline('sentiment-analysis', model='yiyanghkust/finbert-tone')
             logging.info("FinBERT model loaded successfully")
             return model
         except Exception as e:
             logging.warning(f"FinBERT load failed: {e}, using default sentiment model")
-            from transformers import pipeline
             return pipeline('sentiment-analysis')

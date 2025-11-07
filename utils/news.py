@@ -10,7 +10,7 @@ class NewsLoader:
         self.api_key = os.environ.get('NEWSDATA_API_KEY')
         self.keywords = keywords
 
-    def fetch_news(self, count=20):
+    def fetch_news(self, count):
         articles = []
         for keyword in self.keywords:
             try:

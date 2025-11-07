@@ -3,7 +3,6 @@ from dotenv import load_dotenv
 import time
 import logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
-from utils.data_loader import DataCollector
 from utils.db import DatabaseHandler
 from dashboard.app import run_dashboard
 

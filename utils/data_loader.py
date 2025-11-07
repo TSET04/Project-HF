@@ -10,7 +10,6 @@ from utils.news import NewsLoader
 _collector_thread = None
 _collector_lock = threading.Lock()
 
-
 class DataCollector:
     def __init__(self, db, news_keywords=None):
         logging.info('Initializing DataCollector with News sector keywords')
@@ -21,23 +20,162 @@ class DataCollector:
         self.sentiment = FinBertSentimentAnalyzer()
         self.emotion = EmotionClassifier()
 
-    
-        self.mmi_last_update = 0
+        self.timing_config = {
+            'news_collection': {
+                'interval_seconds': 21600,      # 6 hours
+                'last_run': 0,
+            },
+            'mmi_update': {
+                'interval_seconds': 86400,     # 24 hours
+                'last_run': 0,
+            }
+        }        
+
+        self._stop_event = threading.Event()
+        self._wakeup_event = threading.Event()
+
         # Ensure sector news cache table exists (function is idempotent)
         if hasattr(self.db, '_ensure_sector_news_table'):
             self.db._ensure_sector_news_table()
 
     def collection_loop(self):
-        logging.info('Beginning continuous data collection loop')
-        while True:
-            self.collect_sector_news_all()
-            self.collect_news()  # Sentiment ingestion for legacy pipeline/compliance
-            now = time.time()
-            if now - self.mmi_last_update > 3600:
-                logging.info('Triggering MMI updates for all topics')
-                self.update_all_mmi()
-                self.mmi_last_update = now
-            time.sleep(180)  # collect every 3 minutes
+            """
+            Optimized collection loop using Event.wait() instead of time.sleep().
+            Benefits:
+            - Immediate shutdown capability
+            - Lower CPU usage (event-driven waiting)
+            - More responsive to timing changes
+            """
+            logging.info('Beginning continuous data collection loop with optimized scheduling')
+            
+            while not self._stop_event.is_set():
+                current_time = time.time()
+                
+                # Calculate next wake time
+                next_wake_times = []
+                
+                # Check and run news collection
+                if self._should_run('news_collection', current_time):
+                    logging.info('Running news collection cycle...')
+                    
+                    try:
+                        self.collect_sector_news_all()
+                        self.collect_news()
+                        self.timing_config['news_collection']['last_run'] = current_time
+                        logging.info('News collection complete')
+                    except Exception as e:
+                        logging.error(f"Error in news collection: {e}")
+                
+                # Calculate time until next news collection
+                news_next = self._time_until_next_run('news_collection', current_time)
+                next_wake_times.append(news_next)
+                
+                # Check and run MMI update
+                if self._should_run('mmi_update', current_time):
+                    logging.info('Running MMI update cycle...')
+                    
+                    try:
+                        self.update_all_mmi()
+                        self.timing_config['mmi_update']['last_run'] = current_time
+                        logging.info('MMI update complete. Next run in 1 hour.')
+                    except Exception as e:
+                        logging.error(f"Error in MMI update: {e}")
+                
+                # Calculate time until next MMI update
+                mmi_next = self._time_until_next_run('mmi_update', current_time)
+                next_wake_times.append(mmi_next)
+                
+                # Sleep until the next task is due (whichever comes first)
+                sleep_duration = min(next_wake_times)
+                
+                logging.debug(f"Sleeping for {sleep_duration:.1f} seconds until next task")
+                
+                if self._stop_event.wait(timeout=sleep_duration):
+                    logging.info("Stop event received, exiting collection loop")
+                    break
+        
+    def _should_run(self, task_name, current_time):
+        """
+        Check if enough time has passed since last run.
+        
+        Args:
+            task_name: Key from timing_config
+            current_time: Current timestamp
+            
+        Returns:
+            bool: True if task should run
+        """
+        task = self.timing_config[task_name]
+        time_elapsed = current_time - task['last_run']
+        return time_elapsed >= task['interval_seconds']
+    
+    def _time_until_next_run(self, task_name, current_time):
+        """
+        Calculate how many seconds until this task should run again.
+        
+        Args:
+            task_name: Key from timing_config
+            current_time: Current timestamp
+            
+        Returns:
+            float: Seconds until next run (minimum 0)
+        """
+        task = self.timing_config[task_name]
+        time_elapsed = current_time - task['last_run']
+        time_remaining = task['interval_seconds'] - time_elapsed
+        return max(0, time_remaining)
+    
+    def stop(self):
+        """
+        Gracefully stop the collection loop.
+        This will interrupt the wait and exit cleanly.
+        """
+        logging.info("Stopping data collector...")
+        self._stop_event.set()
+    
+    def get_timing_status(self):
+        """
+        Get human-readable status of all timed tasks.
+        Useful for debugging and monitoring.
+        """
+        current_time = time.time()
+        status = {}
+        
+        for task_name, config in self.timing_config.items():
+            time_since_last = current_time - config['last_run']
+            time_until_next = self._time_until_next_run(task_name, current_time)
+            
+            status[task_name] = {
+                'interval': f"{config['interval_seconds'] / 60} minutes",
+                'last_run_ago': f"{time_since_last / 60:.1f} minutes ago",
+                'next_run_in': f"{time_until_next / 60:.1f} minutes",
+                'is_due': self._should_run(task_name, current_time)
+            }
+        
+        return status
+    
+    def update_timing_config(self, task_name, new_interval_seconds):
+        """
+        Dynamically adjust timing intervals without restarting.
+        The change will take effect on the next loop iteration.
+        
+        Args:
+            task_name: 'news_collection' or 'mmi_update'
+            new_interval_seconds: New interval in seconds
+        """
+        if task_name in self.timing_config:
+            old_interval = self.timing_config[task_name]['interval_seconds']
+            self.timing_config[task_name]['interval_seconds'] = new_interval_seconds
+            logging.info(
+                f'Updated {task_name} interval: '
+                f'{old_interval}s → {new_interval_seconds}s'
+            )
+            # Interrupt current wait to apply changes immediately
+            self._stop_event.set()
+            self._stop_event.clear()
+        else:
+            logging.error(f'Unknown task: {task_name}')
+
     def collect_sector_news_all(self):
         """Loop all sectors and cache fresh news (<24h). Fetch only if outdated or missing."""
         sector_map = getattr(self, 'sector_map', {
@@ -120,8 +258,9 @@ class DataCollector:
                 }
                 self.db.insert_entry(data)
             except Exception as e:
-                logging.error(f"Error processing news: {article.get('text','')} | Exception: {e}")
+                logging.error(f"Exception: {e}")
         logging.info(f"Inserted {len(news)} news articles into DB.")
+        
     def update_all_mmi(self):
         logging.info('Updating all MMIs in the database...')
         all_rows = self.db.fetch_recent_entries(1000)
