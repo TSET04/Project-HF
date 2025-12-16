@@ -12,7 +12,7 @@ from utils.helper import helper
 import threading
 
 class DatabaseHandler:
-    def __init__(self):
+    def __init__(self, indices):
         mysql_host = os.environ.get('MYSQL_HOST')
         mysql_user = os.environ.get('MYSQL_USER')
         mysql_password = os.environ.get('MYSQL_PASSWORD')
@@ -41,7 +41,7 @@ class DatabaseHandler:
         self._ensure_table_mysql()
         self._ensure_mmi_table_mysql()
         self._ensure_sector_news_table()
-        self._ensure_indices_table()
+        self._ensure_indices_table(indices)
         self._ensure_trends_table()
         self._ensure_ai_feedback_table()
     
@@ -106,7 +106,7 @@ class DatabaseHandler:
                     symbol VARCHAR(64),
                     news_title TEXT,
                     news_desc TEXT,
-                    news_url VARCHAR(500),
+                    news_url VARCHAR(1000),
                     published_at VARCHAR(64),
                     cached_at DOUBLE
                 )''')
@@ -114,7 +114,7 @@ class DatabaseHandler:
         finally:
             cursor.close()
 
-    def _ensure_indices_table(self):
+    def _ensure_indices_table(self, indices):
         cursor = self.conn.cursor(buffered=True)
         try:
             cursor.execute('''CREATE TABLE IF NOT EXISTS index_config (
@@ -126,16 +126,7 @@ class DatabaseHandler:
                 )''')
             self.conn.commit()
             
-            # Seed default indices
-            default_indices = [
-                ('^NSEI', 'NIFTY 50'),
-                ('^BSESN', 'BSE SENSEX'),
-                ('^NSEBANK', 'NIFTY BANK'),
-                ('^CNXIT', 'NIFTY IT'),
-                ('^CNXFMCG', 'NIFTY FMCG')
-            ]
-            
-            for ticker, name in default_indices:
+            for ticker, name in indices:
                 try:
                     cursor.execute(
                         "INSERT INTO index_config (ticker, name) VALUES (%s, %s) ON DUPLICATE KEY UPDATE name=%s",
@@ -231,22 +222,31 @@ class DatabaseHandler:
 
         Note: this code treats MMI range as -100..100 and mentions that in the prompt.
         """
-        api_key = os.environ.get('PERPLEXITY_API_KEY')
+        # Skip generating feedback for "NEWS" symbol
+        if symbol == "NEWS":
+            return None
+        api_key = os.environ.get('MISTRAL_API_KEY')
         # deterministic label (based on -100..100)
         label = 'Neutral'
-        if mmi_value <= -40:
-            label = 'Bearish'
-        elif mmi_value > 20:
-            label = 'Bullish'
+        if mmi_value <= 25:
+            label = "Extreme Fear"
+        elif mmi_value <= 50:
+            label = "Fearful / Cautious"
+        elif mmi_value <= 75:
+            label = "Neutral to Optimistic"
+        else:
+            label = "Extreme Greed / Euphoria"
 
         # fallback deterministic message
         def fallback_msg(label, mmi_value):
-            if label == 'Bullish':
-                return f"Bullish — The MMI is {mmi_value}, indicating optimism in this sector. Consider investigating recent positive catalysts before buying."
-            elif label == 'Bearish':
-                return f"Bearish — The MMI is {mmi_value}, indicating fear in this sector. Exercise caution and review downside risks."
+            if label == 'Extreme Fear':
+                return f"Extreme Fear — The MMI is {mmi_value}, indicating panic and strong risk aversion. Markets may be oversold; contrarian opportunities could exist, but caution is advised."
+            elif label == 'Fearful / Cautious':
+                return f"Fearful / Cautious — The MMI is {mmi_value}, showing that sentiment is still defensive. Consider waiting for stronger confirmation before taking major positions."
+            elif label == 'Neutral to Optimistic':
+                return f"Neutral to Optimistic — The MMI is {mmi_value}, suggesting improving confidence and moderate bullish bias. Gradual accumulation may be reasonable."
             else:
-                return f"Neutral — The MMI is {mmi_value}, market mood appears balanced; wait for clearer signals."
+                return f"Extreme Greed / Euphoria — The MMI is {mmi_value}, indicating excessive optimism. Markets could be overheated; profit booking or hedging may be wise."
 
         if not api_key:
             fb = fallback_msg(label, mmi_value)
@@ -256,30 +256,30 @@ class DatabaseHandler:
                 logging.debug(f"Failed to store fallback ai feedback: {e}")
             return fb
 
-        # call Perplexity
+        # call Mistral
         try:
             prompt = (
                 f"You are an unbiased financial assistant. Given only the Market Mood Index (MMI) value {mmi_value} "
-                f"(range -100 to 100), give factual feedback on whether the user should buy, sell, or stay calm. "
+                f"(range 0 to 100), give factual feedback on whether the user should buy, sell, or stay calm. "
                 f"Also, state if the market mood is bullish, bearish, or neutral based purely on MMI statistics. "
                 f"Keep it concise, easy to understand language, and free of bias. Do not repeat the obvious MMI number and information. "
                 f"Avoid giving numbers in square brackets in your response."
             )
 
-            url = "https://api.perplexity.ai/chat/completions"
+            url = "https://api.mistral.ai/v1/chat/completions"
             headers = {
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
             }
 
             data = {
-                "model": "sonar-pro", 
+                "model": "mistral-medium", 
                 "messages": [{"role": "user", "content": prompt}],
                 "temperature": 0.0,
                 "max_tokens": 120,
             }
 
-            logging.info(f"Calling Perplexity for symbol={symbol} mmi={mmi_value}")
+            logging.info(f"Calling Mistral for symbol={symbol} mmi={mmi_value}")
             session = helper.get_retry_session(retries=2, backoff_factor=1.5)
             resp = session.post(url, headers=headers, json=data, timeout=15)
             resp.raise_for_status()
@@ -287,11 +287,12 @@ class DatabaseHandler:
             try:
                 result = resp.json()
             except ValueError:
-                logging.warning("Perplexity returned non-JSON response")
-                raise RuntimeError("Invalid JSON from Perplexity")
+                logging.warning("Mistral returned non-JSON response")
+                raise RuntimeError("Invalid JSON from Mistral")
 
-            logging.debug(f"Perplexity response raw: {result}")
-            result_text = helper.parse_perplexity_response(result) if hasattr(helper, "parse_perplexity_response") else str(result)
+            logging.debug(f"Mistral response raw: {result}")
+            # Mistral API is OpenAI-compatible, so same parsing logic
+            result_text = result["choices"][0]["message"]["content"].strip() if "choices" in result and result["choices"] else str(result)
 
             # Clean up response
             lines = [l.strip() for l in result_text.split("\n") if l.strip()]
@@ -303,10 +304,9 @@ class DatabaseHandler:
             # Additional cleanup: remove markdown, citations, etc.
             fb = fb.replace("**", "").replace("[", "").replace("]", "")
             fb = ' '.join(fb.split())
-            logging.info(f"Perplexity produced feedback for {symbol}: {fb}")
 
         except Exception as e:
-            logging.warning(f'Perplexity API call failed for {symbol}: {e}')
+            logging.warning(f'Mistral API call failed for {symbol}: {e}')
             logging.debug(traceback.format_exc())
             fb = fallback_msg(label, mmi_value)
 
@@ -325,11 +325,10 @@ class DatabaseHandler:
         conn = self._get_connection()
         cursor = conn.cursor(buffered=True)
         try:
-            # Prune any old stories for this symbol
-            cursor.execute("DELETE FROM sector_news_cache WHERE symbol=%s", (symbol,))
+            cursor.execute("""DELETE FROM sector_news_cache WHERE symbol = %s AND cached_at < (NOW() - INTERVAL 1 DAY)""", (symbol,))
             max_cache_time = time.time()
             # Insert up to 10 latest
-            for a in articles[:10]:
+            for a in articles:
                 cursor.execute(
                     "INSERT INTO sector_news_cache (symbol, news_title, news_desc, news_url, published_at, cached_at) VALUES (%s, %s, %s, %s, %s, %s)",
                     (symbol, a.get('title'), a.get('description'), a.get('url'), a.get('publishedAt'), max_cache_time)
@@ -352,7 +351,7 @@ class DatabaseHandler:
         try:
             min_time = time.time() - 86400
             cursor.execute(
-                "SELECT news_title, news_desc, news_url, published_at FROM sector_news_cache WHERE symbol=%s AND cached_at>=%s ORDER BY published_at DESC LIMIT 10",
+                "SELECT news_title, news_desc, news_url, published_at FROM sector_news_cache WHERE symbol=%s AND published_at >= FROM_UNIXTIME(%s) ORDER BY published_at DESC LIMIT 10",
                 (symbol, min_time))
             results = cursor.fetchall()
             return results
@@ -362,7 +361,6 @@ class DatabaseHandler:
         finally:
             cursor.close()
     
-
     def get_mmi_for_topic(self, symbol):
         logging.info(f'Fetching MMI for topic: {symbol}')
         cursor = self._get_cursor()
@@ -383,6 +381,8 @@ class DatabaseHandler:
         Recompute and store MMI for a symbol.
         - rows: list of recent sentiment_data rows (tuples or dicts). We treat it read-only; we do not overwrite it.
         """
+        if symbol == "NEWS":
+            return None
         logging.info(f'Recomputing/storing MMI for topic: {symbol}')
         conn = self._get_connection()
         lock_cursor = conn.cursor(buffered=True)
@@ -543,7 +543,10 @@ class DatabaseHandler:
 
             # --- Clean and deduplicate texts ---
             news_texts = helper.deduplicate_texts(news_texts, min_length=20) if news_texts else []
-            logging.info(f"After deduplication: {len(news_texts)} unique news items")
+            if len(news_texts)==0:
+                logging.warning(f"After deduplication no unique news items left")
+            else:
+                logging.info(f"After deduplication: {len(news_texts)} unique news items")
 
             # --- FinBERT Sentiment Analysis ---
             news_scores = []
@@ -671,7 +674,7 @@ class DatabaseHandler:
 
                                 articles = data.get("results", [])
                                 if not articles:
-                                    logging.info(f"No articles found for keyword: {kw}")
+                                    logging.warning(f"NEWSDATA API NOT WORKING FOR: {kw}")
                                     continue
 
                                 scores = []
@@ -742,17 +745,18 @@ class DatabaseHandler:
 
             # Final MMI calculation (raw values -1..1)
             final_value = 0.4 * news_sentiment + 0.3 * user_feedback_score + 0.3 * index_perf_score
-            final_value_clipped = max(-1.0, min(1.0, final_value))
-            # Scale to -100..100 integer
-            scaled_mmi = int(final_value_clipped * 100)
-            scaled_mmi = max(-100, min(100, scaled_mmi))
+            mmi_raw = max(-1.0, min(1.0, final_value))
+            # Scale to 0..100 integer
+            scaled_mmi = int(((mmi_raw + 1) / 2) * 100)
 
-            if scaled_mmi <= -40:
+            if scaled_mmi <= 25:
                 mood = "Extreme Fear"
-            elif scaled_mmi <= 20:
-                mood = "Cautious / Neutral"
+            elif scaled_mmi <= 50:
+                mood = "Fearful / Cautious"
+            elif scaled_mmi <= 75:
+                mood = "Neutral to Optimistic"
             else:
-                mood = "Optimistic / Greedy"
+                mood = "Extreme Greed / Euphoria"
 
             detail = json.dumps({
                 'news_sentiment': float(news_sentiment),
@@ -763,7 +767,6 @@ class DatabaseHandler:
                 'index_map': {k: float(v) for k, v in index_map.items()},
                 'weights': {'news': 0.4, 'user_feedback': 0.3, 'indices': 0.3},
                 'final_value_raw': float(final_value),
-                'final_value_clipped': float(final_value_clipped),
                 'scaled_mmi': scaled_mmi,
                 'symbol': symbol
             })

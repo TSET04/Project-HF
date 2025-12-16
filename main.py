@@ -5,12 +5,19 @@ import logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 from utils.db import DatabaseHandler
 from dashboard.app import run_dashboard
+from utils.data_loader import start_streams
 
 # ---------- Global Sector Configuration (single source of truth) ----------
 SECTOR_DISPLAY = ['Banking','IT','Pharma','FMCG','Auto']
 SECTOR_DB_KEYS = ['banking','information technology','pharma','fmcg','auto']
+indices = [
+                ('^NSEI', 'NIFTY 50'),
+                ('^BSESN', 'BSE SENSEX'),
+                ('^NSEBANK', 'NIFTY BANK'),
+                ('^CNXIT', 'NIFTY IT'),
+                ('^CNXFMCG', 'NIFTY FMCG')
+                ]
 SECTOR_MAP = dict(zip(SECTOR_DISPLAY, SECTOR_DB_KEYS))
-NEWS_KEYWORDS = ['banking sector india','it sector india','pharma sector india','fmcg sector india','auto sector india']
 # -------------------------------------------------------------------------
 
 def initialize_mmi_cache(db):
@@ -43,15 +50,14 @@ load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), '.env'))
 
 def main():
     logging.info("Starting main()")
-    db = DatabaseHandler()
+    db = DatabaseHandler(indices)
     logging.info('DatabaseHandler initialized')
     initialize_mmi_cache(db)
     logging.info('MMI cache initialized')
     # Start background collector (idempotent)
-    from utils.data_loader import start_streams
-    start_streams(db_config=None)
+    start_streams(sector_map = SECTOR_MAP, indices=indices)
     logging.info('Data stream collection requested (start_streams)')
-    run_dashboard(db, sector_map=SECTOR_MAP)
+    run_dashboard(db=db, sector_map=SECTOR_MAP)
 
 if __name__ == "__main__":
     main()

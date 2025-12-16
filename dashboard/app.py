@@ -3,17 +3,14 @@ import pandas as pd
 import plotly.graph_objs as go
 import time
 import json
-import os
-import requests
 from utils.db import DatabaseHandler
-import matplotlib.pyplot as plt
-from streamlit.components.v1 import html
+
 
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning)  # Silences SettingWithCopy
 import logging
 
-def run_dashboard(db=None, sector_map=None):
+def run_dashboard(db, sector_map):
     logging.info('Starting (or refreshing) dashboard UI...')
     st.set_page_config(page_title="Market Mood AI", layout="wide")
     if db is None:
@@ -91,13 +88,7 @@ def run_dashboard(db=None, sector_map=None):
     st.markdown("<div class='subtitle'>Live sector-wise Indian market mood analysis</div>", unsafe_allow_html=True)
 
     # Sector configuration
-    if sector_map is None or not len(sector_map):
-        # default if not injected
-        sector_options = ['Banking','IT','Pharma','FMCG','Auto']
-        sector_db_keys = ['banking','information technology','pharma','fmcg','auto']
-        sector_map = dict(zip(sector_options, sector_db_keys))
-    sector_options = list(sector_map.keys())
-    sector_db_keys = list(sector_map.values())
+    sector_db_keys  = list(sector_map.keys())
 
     # BOOTSTRAP: Ensure MMIs are computed for all sectors before rendering UI (only if stale >24h)
     if 'mmi_bootstrap_done' not in st.session_state or not st.session_state['mmi_bootstrap_done']:
@@ -137,7 +128,7 @@ def run_dashboard(db=None, sector_map=None):
         else:
             return
 
-    selected_sector = st.selectbox('Select Sector', sector_options, key='sector_select')
+    selected_sector = st.selectbox('Select Sector', sector_db_keys, key='sector_select')
     if not selected_sector:
         st.info("Please select a sector above to view the dashboard.")
         st.stop()
@@ -173,13 +164,11 @@ def run_dashboard(db=None, sector_map=None):
     # MMI Gauge + AI feedback
     with st.container():
         st.markdown("""<div class='glass-card'>""", unsafe_allow_html=True)
-        # Map internal MMI (-100..100) to display 0..100 for progress/gauge
-        display_mmi = max(0.0, min(100.0, (float(mmi_info['mmi']) + 100.0) / 2.0))
         st.markdown(f"<div class='section-title'>Market Mood Index (MMI) for <b>{selected_sector}</b>: <i>{mmi_info['mood']}</i></div>", unsafe_allow_html=True)
-        st.progress(display_mmi/100.0)
+        st.progress(mmi_info['mmi']/100.0)
         fig_gauge = go.Figure(go.Indicator(
             mode = "gauge+number",
-            value = display_mmi,
+            value = mmi_info['mmi'],
             title = {'text': f"Market Mood Index (MMI)"},
             gauge = {
                 'axis': {'range': [0, 100]},
