@@ -1,6 +1,6 @@
 import os
 import requests
-from datetime import datetime
+import logging
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -8,9 +8,9 @@ load_dotenv()
 class NewsLoader:
     def __init__(self, keywords):
         self.api_key = os.environ.get('NEWSDATA_API_KEY')
-        self.keywords = keywords
+        self.keywords = [keyword + " sector India" for keyword in keywords]
 
-    def fetch_news(self, count):
+    def fetch_news(self, count=15):
         articles = []
         for keyword in self.keywords:
             try:
@@ -26,17 +26,18 @@ class NewsLoader:
                 resp.raise_for_status()
                 data = resp.json()
 
+                symbol = keyword.split(" ")[0]
                 for item in data.get('results', [])[:count]:
                     articles.append({
                         'timestamp': item.get('pubDate'),
                         'text': (item.get('title', '') or '') + ' ' + (item.get('description', '') or ''),
-                        'symbol': 'NEWS'
+                        'symbol': symbol
                     })
             except Exception as e:
                 print(f"NewsData.io error for '{keyword}': {e}")
         return articles
 
-    def fetch_raw_news(self, q, count=10):
+    def fetch_raw_news(self, q, count=25):
         articles = []
         try:
             query = q.replace(" ", "+")

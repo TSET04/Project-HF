@@ -1,4 +1,16 @@
 # Market-Mood AI
+# Market-Mood AI
+
+## Mistral API Integration
+This project now uses the Mistral API for AI feedback instead of Perplexity. You must set your Mistral API key in your environment:
+
+```
+MISTRAL_API_KEY=your-mistral-api-key-here
+```
+
+Remove any `PERPLEXITY_API_KEY` from your environment if present.
+
+No additional dependencies are required for Mistral (uses `requests`).
 
 Market-Mood AI is an AI-driven sentiment intelligence dashboard tailored for hedge funds and traders. It analyzes real-time sentiment from X (formerly Twitter) and financial news to compute a continuous Market Mood Index (MMI), and visualizes key metrics for smart market decision-making.
 
@@ -33,7 +45,7 @@ See below sections for setup, environment variables, and usage.
 1. Create a file named `.env` in the `market_mood_ai/` directory (see `.env.example`) and fill in:
     - X (Twitter) API Bearer Token (`TWITTER_BEARER_TOKEN` from your Developer Portal Project)
     - NewsAPI key
-    - Perplexity API key for summary (see https://docs.perplexity.ai/)
+    - MISTRAL_API_KEY for summary (see https://docs.mistral.ai/)
     - (Optional) MongoDB URI
     - (Optional) MySQL: MYSQL_HOST, MYSQL_USER, MYSQL_PASSWORD, MYSQL_DATABASE
     - If neither MongoDB nor MySQL: uses local SQLite by default

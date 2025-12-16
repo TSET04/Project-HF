@@ -12,46 +12,24 @@ class helper:
         self.deduplicate_texts()
         self.get_retry_session()
         
-    def parse_perplexity_response(response_data):
+    def parse_mistral_response(response_data):
         """
-        Safely parse Perplexity API response with multiple fallback strategies.
-        
+        Safely parse Mistral API response (OpenAI-compatible format).
         Args:
-            response_data: JSON response from Perplexity API
-        
+            response_data: JSON response from Mistral API
         Returns:
             Extracted text content or error message
         """
         try:
-            # Strategy 1: Standard OpenAI-compatible format
             if "choices" in response_data and response_data["choices"]:
                 message = response_data["choices"][0].get("message", {})
                 content = message.get("content")
                 if content:
                     return content.strip()
-            
-            # Strategy 2: Direct output_text field
-            if "output_text" in response_data:
-                return response_data["output_text"].strip()
-            
-            # Strategy 3: Text field
-            if "text" in response_data:
-                return response_data["text"].strip()
-            
-            # Strategy 4: Nested content structures
-            if "result" in response_data:
-                result = response_data["result"]
-                if isinstance(result, dict) and "content" in result:
-                    return result["content"].strip()
-                elif isinstance(result, str):
-                    return result.strip()
-            
-            # No valid content found
-            logging.warning(f"Unexpected Perplexity response structure: {list(response_data.keys())}")
+            logging.warning(f"Unexpected Mistral response structure: {list(response_data.keys())}")
             return "No response text available"
-            
         except Exception as e:
-            logging.error(f"Error parsing Perplexity response: {e}")
+            logging.error(f"Error parsing Mistral response: {e}")
             return f"Response parsing error: {str(e)}"
 
     def deduplicate_texts(texts, min_length=20):

@@ -11,12 +11,10 @@ _collector_thread = None
 _collector_lock = threading.Lock()
 
 class DataCollector:
-    def __init__(self, db, news_keywords=None):
+    def __init__(self, db, news_keywords):
         logging.info('Initializing DataCollector with News sector keywords')
         self.db = db
-        self.news_loader = NewsLoader(keywords=(news_keywords or [
-            "banking sector india", "it sector india", "pharma sector india", "fmcg sector india", "auto sector india"
-        ]))
+        self.news_loader = NewsLoader(keywords=news_keywords)
         self.sentiment = FinBertSentimentAnalyzer()
         self.emotion = EmotionClassifier()
 
@@ -38,7 +36,7 @@ class DataCollector:
         if hasattr(self.db, '_ensure_sector_news_table'):
             self.db._ensure_sector_news_table()
 
-    def collection_loop(self):
+    def collection_loop(self, sector_map):
             """
             Optimized collection loop using Event.wait() instead of time.sleep().
             Benefits:
@@ -59,7 +57,7 @@ class DataCollector:
                     logging.info('Running news collection cycle...')
                     
                     try:
-                        self.collect_sector_news_all()
+                        self.collect_sector_news_all(sector_map)
                         self.collect_news()
                         self.timing_config['news_collection']['last_run'] = current_time
                         logging.info('News collection complete')
@@ -77,7 +75,7 @@ class DataCollector:
                     try:
                         self.update_all_mmi()
                         self.timing_config['mmi_update']['last_run'] = current_time
-                        logging.info('MMI update complete. Next run in 1 hour.')
+                        logging.info('MMI update complete')
                     except Exception as e:
                         logging.error(f"Error in MMI update: {e}")
                 
@@ -176,15 +174,8 @@ class DataCollector:
         else:
             logging.error(f'Unknown task: {task_name}')
 
-    def collect_sector_news_all(self):
+    def collect_sector_news_all(self, sector_map):
         """Loop all sectors and cache fresh news (<24h). Fetch only if outdated or missing."""
-        sector_map = getattr(self, 'sector_map', {
-            'banking': 'banking sector india',
-            'information technology': 'it sector india',
-            'pharma': 'pharma sector india',
-            'fmcg': 'fmcg sector india',
-            'auto': 'auto sector india'
-        })
 
         def _parse_timestamp(ts):
             if not ts:
@@ -235,7 +226,7 @@ class DataCollector:
 
             # 🚀 No fresh cache 
             logging.info(f"No fresh cache found for {symbol}, fetching from NewsData...")
-            articles = self.news_loader.fetch_raw_news(q=keyword, count=10)
+            articles = self.news_loader.fetch_raw_news(q=keyword)
 
             if articles:
                 self.db.insert_sector_news(symbol, articles)
@@ -243,7 +234,7 @@ class DataCollector:
 
     def collect_news(self):
         logging.info('Fetching news articles for sectors...')
-        news = self.news_loader.fetch_news(count=10)
+        news = self.news_loader.fetch_news()
         for article in news:
             try:
                 score = self.sentiment.predict(article['text'])
@@ -264,7 +255,9 @@ class DataCollector:
     def update_all_mmi(self):
         logging.info('Updating all MMIs in the database...')
         all_rows = self.db.fetch_recent_entries(1000)
+        # Filter out 'NEWS' symbol and get unique symbols
         symbols = set([row[4] if isinstance(row, (list, tuple)) else row['symbol'] for row in all_rows])
+        symbols.discard('NEWS')  # Remove 'NEWS' symbol if present
         now = time.time()
         for sym in symbols:
             rec = self.db.get_mmi_for_topic(sym)
@@ -276,7 +269,7 @@ class DataCollector:
         logging.info('All MMIs updated (only outdated ones recomputed).')
 
 
-def start_streams(db_config=None):
+def start_streams(sector_map, indices):
     """Start the background data collector exactly once per process.
 
     This is idempotent and safe to call multiple times (e.g., on Streamlit reloads).
@@ -288,9 +281,9 @@ def start_streams(db_config=None):
 
         def thread_target():
             # Create a fresh DB handler inside the thread to avoid sharing connections across threads
-            db_thread = db.DatabaseHandler()
-            thread_collector = DataCollector(db_thread)
-            thread_collector.collection_loop()
+            db_thread = db.DatabaseHandler(indices)
+            thread_collector = DataCollector(db=db_thread, news_keywords=list(sector_map.keys()))
+            thread_collector.collection_loop(sector_map)
 
         t = threading.Thread(target=thread_target, daemon=True)
         t.start()
