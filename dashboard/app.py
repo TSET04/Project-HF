@@ -3,14 +3,17 @@ import pandas as pd
 import plotly.graph_objs as go
 import time
 import json
+from typing import Dict
+
 from utils.db import DatabaseHandler
+from config import SECTOR_MAP
 
 
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning)  # Silences SettingWithCopy
 import logging
 
-def run_dashboard(db, sector_map):
+def run_dashboard(db: DatabaseHandler, sector_map: Dict[str, str] = SECTOR_MAP) -> None:
     logging.info('Starting (or refreshing) dashboard UI...')
     st.set_page_config(page_title="Market Mood AI", layout="wide")
     if db is None:
@@ -88,7 +91,7 @@ def run_dashboard(db, sector_map):
     st.markdown("<div class='subtitle'>Live sector-wise Indian market mood analysis</div>", unsafe_allow_html=True)
 
     # Sector configuration
-    sector_db_keys  = list(sector_map.keys())
+    sector_db_keys = list(sector_map.keys())
 
     # BOOTSTRAP: Ensure MMIs are computed for all sectors before rendering UI (only if stale >24h)
     if 'mmi_bootstrap_done' not in st.session_state or not st.session_state['mmi_bootstrap_done']:
@@ -135,13 +138,33 @@ def run_dashboard(db, sector_map):
     symbol_key = sector_map[selected_sector]
 
     all_rows = db.fetch_recent_entries(500)
+
     def rows_to_df(rows):
-        cols = ['id','timestamp','source','text','symbol','sentiment_score','emotion']
+        """Normalize raw DB rows into a dataframe with stable columns used by the UI."""
+        cols = ['id', 'timestamp', 'source', 'text', 'symbol', 'sentiment_score', 'emotion']
         if not rows:
             logging.warning('Dashboard received empty data rows!')
             return pd.DataFrame([], columns=cols)
+
+        # Rows coming directly from MySQL are tuples with many columns;
+        # select only the indices we care about, guarding against schema changes.
         if isinstance(rows[0], (list, tuple)):
-            return pd.DataFrame(rows, columns=cols)
+            raw = pd.DataFrame(rows)
+            out = pd.DataFrame()
+            index_map = [
+                ('id', 0),
+                ('timestamp', 1),
+                ('source', 2),
+                ('text', 3),
+                ('symbol', 4),
+                ('sentiment_score', 5),
+                ('emotion', 6),
+            ]
+            for name, idx in index_map:
+                out[name] = raw.iloc[:, idx] if idx < raw.shape[1] else None
+            return out
+
+        # Dict-like rows (if ever used) – ensure required columns exist
         df = pd.DataFrame(rows)
         for c in cols:
             if c not in df.columns:
@@ -180,7 +203,7 @@ def run_dashboard(db, sector_map):
                 'bar': {'color':'#5370ff'}
             }
         ))
-        st.plotly_chart(fig_gauge, width = 'stretch')
+        st.plotly_chart(fig_gauge, width='stretch')
 
         # AI feedback read-only from DB
         try:
@@ -201,15 +224,16 @@ def run_dashboard(db, sector_map):
         """, unsafe_allow_html=True)
         st.markdown("""</div>""", unsafe_allow_html=True)
 
-    # MMI definition card
+    # MMI definition & explainability card
     with st.container():
         st.markdown("""<div class='section-div'>""", unsafe_allow_html=True)
         st.markdown("#### What is the Market Mood Index (MMI)?")
-        st.write("""The Market Mood Index (MMI) is a simple number that indicates whether online sentiment and market indicators are positive or negative for a sector. It combines news sentiment (40%), Google Trends-based user sentiment (30%), and index performance (30%).""")
+        st.write("""The Market Mood Index (MMI) is a simple number that indicates whether online sentiment and market indicators are positive or negative for a sector. It combines news sentiment, Google Trends-based user sentiment, and index performance into a single normalized score."""
+        )
         # Parse stored detail JSON (if available) and display underlying parameters
         try:
             detail_json = json.loads(mmi_info.get('detail') or '{}')
-            # Extract component scores and index map
+            # Extract component scores, attribution, and index map
             news_s = detail_json.get('news_sentiment', None)
             trend_s = detail_json.get('trend_sentiment', None)
             idx_perf = detail_json.get('index_perf_score', None)
@@ -248,6 +272,56 @@ def run_dashboard(db, sector_map):
                             f"<div style='font-weight:700'>{name}</div>"
                             f"<div style='margin-top:6px; font-size:1.05em'>{pct:.2f}%</div>"
                             f"</div>", unsafe_allow_html=True)
+
+            # Additional explainability: sector sentiment breakdown & data freshness
+            sector_breakdown = detail_json.get('sector_sentiment_breakdown') or {}
+            freshness = detail_json.get('data_freshness') or {}
+            contrib = (detail_json.get('contributors_1d') or {})
+
+            # Sector-wise sentiment breakdown (counts)
+            counts = sector_breakdown.get('counts') or {}
+            if counts:
+                total = max(1, sum(counts.values()))
+                pos = counts.get('positive', 0)
+                neg = counts.get('negative', 0)
+                neu = counts.get('neutral', 0)
+                st.markdown("**Sector-wise sentiment breakdown (last 24h):**")
+                cols_sb = st.columns(3)
+                cols_sb[0].metric("Positive", f"{pos}", f"{(pos/total)*100:.0f}%")
+                cols_sb[1].metric("Neutral", f"{neu}", f"{(neu/total)*100:.0f}%")
+                cols_sb[2].metric("Negative", f"{neg}", f"{(neg/total)*100:.0f}%")
+
+            # Data freshness indicator
+            latest_ts = freshness.get('latest_ingestion_ts')
+            if latest_ts:
+                age_sec = float(freshness.get('age_seconds') or 0)
+                age_min = age_sec / 60.0
+                st.markdown(
+                    f"<div style='margin-top:10px; color:#9ef0b0;'>"
+                    f"Last data ingestion for this sector was <b>{age_min:.1f} minutes</b> ago."
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+
+            # Top contributing headlines/posts (explainability)
+            top_pos = contrib.get('top_positive') or []
+            top_neg = contrib.get('top_negative') or []
+            if top_pos or top_neg or mmi_info.get('news_summary'):
+                st.markdown("---")
+                st.markdown("#### Why did the MMI move?")
+                if mmi_info.get('news_summary'):
+                    st.markdown(
+                        f"<div style='color:#d7eaff;'>{mmi_info['news_summary']}</div>",
+                        unsafe_allow_html=True,
+                    )
+                if top_pos:
+                    st.markdown("**Top positive drivers (recent):**")
+                    for item in top_pos[:3]:
+                        st.markdown(f"- {item.get('text','')}")
+                if top_neg:
+                    st.markdown("**Top negative drivers (recent):**")
+                    for item in top_neg[:3]:
+                        st.markdown(f"- {item.get('text','')}")
         except Exception as e:
             logging.debug(f'Could not parse MMI detail JSON: {e}')
         st.markdown("""</div>""", unsafe_allow_html=True)
@@ -267,17 +341,114 @@ def run_dashboard(db, sector_map):
         st.info('No recent news found for this sector.')
     st.markdown("</div>", unsafe_allow_html=True)
 
-    # Sentiment trend chart (5-min mean)
-    filter_df = df.copy() if not symbol_key else df[df['symbol']==symbol_key]
-    if not filter_df.empty:
-        filter_df['timestamp'] = pd.to_datetime(filter_df['timestamp'], errors='coerce')
-        filter_df = filter_df.dropna(subset=['timestamp'])
-        filter_df = filter_df.sort_values('timestamp')
-        trend = filter_df.groupby(filter_df['timestamp'].dt.floor('5min'))['sentiment_score'].mean()
-        st.markdown("<div class='glass-card'>", unsafe_allow_html=True)
-        st.markdown('#### Sentiment Trend (5-min Mean)')
-        fig_trend = go.Figure()
-        fig_trend.add_trace(go.Scatter(x=trend.index, y=trend.values, mode='lines+markers', name='Sentiment Avg', line=dict(color='#74cae9')))
-        fig_trend.update_layout(margin=dict(l=20, r=20, t=25, b=18), plot_bgcolor='#181d29', paper_bgcolor='#181d29', font_color='#d3e0ff', font_size=16)
-        st.plotly_chart(fig_trend, width = 'stretch')
+    # ----------------------- MMI over time (analytics) ----------------------- #
+    st.markdown("<div class='glass-card'>", unsafe_allow_html=True)
+    st.markdown("#### Historical MMI & Confidence Band")
+
+    # Fetch up to 90 days of history from DB (daily snapshots)
+    history_rows = db.get_mmi_history(symbol_key, days=90)
+    if not history_rows:
+        st.info("Not enough historical MMI data stored yet to show trends.")
         st.markdown("</div>", unsafe_allow_html=True)
+        return
+
+    hist_df = pd.DataFrame(history_rows, columns=["as_of", "mmi"])
+    hist_df["timestamp"] = pd.to_datetime(hist_df["as_of"], unit="s")
+    hist_df = hist_df.sort_values("timestamp")
+
+    if hist_df.empty:
+        st.info("Not enough historical MMI data stored yet to show trends.")
+        st.markdown("</div>", unsafe_allow_html=True)
+        return
+
+    # Determine available windows (7/30/90) based on actual span of history
+    total_span_days = (hist_df["timestamp"].iloc[-1] - hist_df["timestamp"].iloc[0]).days or 0
+    candidate_windows = [7, 30, 90]
+    available_windows = [d for d in candidate_windows if total_span_days >= d]
+
+    if not available_windows:
+        st.info(
+            f"Historical MMI is stored, but less than 7 days are available so far "
+            f"(~{total_span_days} days). Chart will appear once more history accumulates."
+        )
+        st.markdown("</div>", unsafe_allow_html=True)
+        return
+
+    col_left, col_right = st.columns(2)
+    with col_left:
+        range_days = st.selectbox(
+            "Time range",
+            options=available_windows,
+            format_func=lambda x: f"Last {x} days",
+            index=min(1, len(available_windows) - 1),  # prefer middle option when possible
+            key="mmi_range_days",
+        )
+    with col_right:
+        # Kept for future extension; currently source-wise history is aggregated in one MMI series.
+        st.write("")
+        st.caption(f"Showing stored MMI snapshots for the last {range_days} days.")
+
+    # Filter history to the selected window
+    cutoff = hist_df["timestamp"].iloc[-1] - pd.Timedelta(days=range_days)
+    hist_plot = hist_df[hist_df["timestamp"] >= cutoff].copy()
+
+    if hist_plot.empty:
+        st.info("No historical MMI data available for the selected time range.")
+        st.markdown("</div>", unsafe_allow_html=True)
+        return
+
+    # Build a simple confidence band using a rolling standard deviation over the stored MMI values
+    hist_plot = hist_plot.sort_values("timestamp")
+    mmi_series = hist_plot["mmi"].astype(float)
+    mmi_rolling = mmi_series.rolling(window=5, min_periods=2)
+    mmi_mean = mmi_rolling.mean()
+    mmi_std = mmi_rolling.std()
+
+    fig_mmi = go.Figure()
+    fig_mmi.add_trace(
+        go.Scatter(
+            x=hist_plot["timestamp"],
+            y=mmi_series,
+            mode="lines",
+            name="MMI (daily snapshot)",
+            line=dict(color="#74cae9"),
+        )
+    )
+
+    if mmi_std.notna().any():
+        upper = (mmi_mean + 1.96 * mmi_std).clip(0, 100)
+        lower = (mmi_mean - 1.96 * mmi_std).clip(0, 100)
+        fig_mmi.add_trace(
+            go.Scatter(
+                x=hist_plot["timestamp"],
+                y=upper,
+                mode="lines",
+                line=dict(width=0),
+                showlegend=False,
+                hoverinfo="skip",
+            )
+        )
+        fig_mmi.add_trace(
+            go.Scatter(
+                x=hist_plot["timestamp"],
+                y=lower,
+                mode="lines",
+                fill="tonexty",
+                line=dict(width=0),
+                name="Confidence band",
+                hoverinfo="skip",
+                fillcolor="rgba(116, 202, 233, 0.2)",
+            )
+        )
+
+    fig_mmi.update_layout(
+        margin=dict(l=20, r=20, t=25, b=18),
+        plot_bgcolor="#181d29",
+        paper_bgcolor="#181d29",
+        font_color="#d3e0ff",
+        font_size=16,
+        yaxis=dict(range=[0, 100], title="Scaled MMI (0–100)"),
+    )
+    st.plotly_chart(fig_mmi, use_container_width=True)
+
+    st.markdown("</div>", unsafe_allow_html=True)

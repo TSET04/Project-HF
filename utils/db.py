@@ -4,9 +4,7 @@ import logging
 import json
 import mysql.connector
 import numpy as np
-import yfinance as yf
 import time
-from textblob import TextBlob
 import traceback
 from utils.helper import helper
 import threading
@@ -44,6 +42,7 @@ class DatabaseHandler:
         self._ensure_indices_table(indices)
         self._ensure_trends_table()
         self._ensure_ai_feedback_table()
+        self._ensure_mmi_history_table()
     
     def _get_connection(self):
         """Get thread-local connection or create new one"""
@@ -95,6 +94,13 @@ class DatabaseHandler:
                 self.conn.commit()
             except Exception as e:
                 logging.debug(f"Could not alter mmi_cache.mood: {e}")
+            # Ensure optional explainability column exists
+            try:
+                cursor.execute("ALTER TABLE mmi_cache ADD COLUMN news_summary TEXT")
+                self.conn.commit()
+            except Exception:
+                # Column already exists or cannot be altered – safe to ignore
+                pass
         finally:
             cursor.close()
 
@@ -177,6 +183,30 @@ class DatabaseHandler:
                     feedback TEXT,
                     cached_at DOUBLE
                 )''')
+            self.conn.commit()
+        finally:
+            cursor.close()
+
+    def _ensure_mmi_history_table(self):
+        """Table to store daily MMI history snapshots for each symbol."""
+        cursor = self.conn.cursor(buffered=True)
+        try:
+            cursor.execute(
+                '''CREATE TABLE IF NOT EXISTS mmi_history (
+                        id INT AUTO_INCREMENT PRIMARY KEY,
+                        symbol VARCHAR(64),
+                        mmi INT,
+                        as_of DOUBLE,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE KEY uniq_symbol_asof (symbol, as_of)
+                    )'''
+            )
+            try:
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_mmi_history_symbol_asof ON mmi_history(symbol, as_of)"
+                )
+            except Exception:
+                pass
             self.conn.commit()
         finally:
             cursor.close()
@@ -376,11 +406,12 @@ class DatabaseHandler:
         finally:
             cursor.close()
 
+
     def recompute_and_store_mmi(self, symbol, rows, user_feedbacks=None):
         """
-        Recompute and store MMI for a symbol.
-        - rows: list of recent sentiment_data rows (tuples or dicts). We treat it read-only; we do not overwrite it.
+        Recompute and store MMI for a symbol with explicit weighting, rolling windows, outlier handling, z-score normalization, and component-level contributions.
         """
+        import scipy.stats
         if symbol == "NEWS":
             return None
         logging.info(f'Recomputing/storing MMI for topic: {symbol}')
@@ -412,343 +443,56 @@ class DatabaseHandler:
                 logging.info(f'Using cached MMI for {symbol} (age <24h)')
                 return existing['mmi']
 
-            # -------------------------
-            # Fetch active index tickers from database (use different variable name so we don't shadow `rows`)
-            idx_cursor = conn.cursor(buffered=True)
-            try:
-                idx_cursor.execute("SELECT ticker FROM index_config WHERE active=TRUE")
-                index_rows = idx_cursor.fetchall()
-                index_tickers = [r[0] for r in index_rows]
-            except Exception as e:
-                logging.warning(f"Failed to read index_config: {e}")
-                index_tickers = []
-            finally:
-                idx_cursor.close()
+            # Rolling windows: 1D, 7D, 30D
+            def filter_by_window(rows, days):
+                cutoff = now_ts - days * 86400
+                return [r for r in rows if float(r[0]) >= cutoff]
 
-            if not index_tickers:
-                # Fallback to defaults if table is empty
-                index_tickers = ['^NSEI', '^BSESN', '^NSEBANK', '^CNXIT', '^CNXFMCG']
+            rows_1d = filter_by_window(rows, 1)
+            rows_7d = filter_by_window(rows, 7)
+            rows_30d = filter_by_window(rows, 30)
 
-            index_changes = []
-            index_map = {}
-            fresh_map = {}
+            # Outlier handling: remove sentiment_score outliers (z-score > 3)
+            def remove_outliers(scores):
+                if len(scores) < 5:
+                    return scores
+                z = np.abs(scipy.stats.zscore(scores))
+                return [s for s, zval in zip(scores, z) if zval < 3]
 
-            # try to get cached index values
-            idx_cache_cursor = conn.cursor(buffered=True)
-            try:
-                placeholders = ','.join(['%s'] * len(index_tickers))
-                q = f"SELECT ticker, pct_change, cached_at FROM indices_cache WHERE ticker IN ({placeholders})"
-                params = tuple(index_tickers)
-                idx_cache_cursor.execute(q, params)
-                rows_idx = idx_cache_cursor.fetchall()
-                for r in rows_idx:
-                    try:
-                        ticker = r[0]
-                        pct = float(r[1]) if r[1] is not None else None
-                        cached_at = float(r[2]) if r[2] is not None else 0.0
-                        if pct is not None:
-                            fresh_map[ticker] = (pct, cached_at)
-                            if cached_at >= one_day_ago:
-                                index_changes.append(pct)
-                    except Exception:
-                        continue
-            except Exception as e:
-                logging.warning(f"indices_cache lookup failed: {e}")
-            finally:
-                idx_cache_cursor.close()
+            # Source-wise weighting: news=0.5, social=0.3, other=0.2
+            def weighted_sentiment(rows):
+                news_scores = [float(r[5]) for r in rows if r[2]=='news' and r[5] is not None]
+                social_scores = [float(r[5]) for r in rows if r[2] in ('twitter','social') and r[5] is not None]
+                other_scores = [float(r[5]) for r in rows if r[2] not in ('news','twitter','social') and r[5] is not None]
+                news_scores = remove_outliers(news_scores)
+                social_scores = remove_outliers(social_scores)
+                other_scores = remove_outliers(other_scores)
+                w_news = 0.5
+                w_social = 0.3
+                w_other = 0.2
+                comp = {
+                    'news': float(np.mean(news_scores)) if news_scores else 0.0,
+                    'social': float(np.mean(social_scores)) if social_scores else 0.0,
+                    'other': float(np.mean(other_scores)) if other_scores else 0.0
+                }
+                total = w_news*comp['news'] + w_social*comp['social'] + w_other*comp['other']
+                return total, comp
 
-            # fetch missing tickers from yfinance and store them with cached_at
-            missing = [t for t in index_tickers if t not in fresh_map]
-            if missing:
-                ins_cursor = conn.cursor(buffered=True)
-                try:
-                    for code in missing:
-                        try:
-                            data = yf.download(code, period='2d', interval='1d', progress=False)
-                            if data is not None and not data.empty and len(data['Close'].values) >= 2:
-                                pct = (data['Close'].values[-1] - data['Close'].values[-2]) / float(data['Close'].values[-2])
-                                index_changes.append(float(pct))
-                                index_map[code] = float(pct)
-                                # insert into cache (try update then insert to avoid duplicate issues)
-                                try:
-                                    ins_cursor.execute("INSERT INTO indices_cache (ticker, pct_change, cached_at) VALUES (%s, %s, %s)",
-                                                       (code, float(pct), now_ts))
-                                except Exception:
-                                    try:
-                                        ins_cursor.execute("UPDATE indices_cache SET pct_change=%s, cached_at=%s WHERE ticker=%s",
-                                                           (float(pct), now_ts, code))
-                                    except Exception as e:
-                                        logging.debug(f"Failed to upsert indices_cache for {code}: {e}")
-                        except Exception as e:
-                            logging.debug(f"yfinance fetch failed for {code}: {e}")
-                            continue
-                    try:
-                        conn.commit()
-                    except Exception:
-                        try:
-                            conn.rollback()
-                        except Exception:
-                            pass
-                finally:
-                    ins_cursor.close()
+            # Use 1D window for current MMI
+            mmi_raw, comp_1d = weighted_sentiment(rows_1d)
+            # 7D and 30D for reference
+            mmi_7d, comp_7d = weighted_sentiment(rows_7d)
+            mmi_30d, comp_30d = weighted_sentiment(rows_30d)
 
-            # include any cached values we loaded earlier in the index_map if not present
-            for t in index_tickers:
-                if t in fresh_map and t not in index_map:
-                    index_map[t] = float(fresh_map[t][0])
-
-            # normalize index changes to 0..1 range; guard empty lists
-            if index_changes:
-                # using a fixed window but guard extreme outliers by clipping then normalizing
-                min_v, max_v = -0.05, 0.05
-                normed = [max(0.0, min(1.0, (c - min_v) / (max_v - min_v))) for c in index_changes]
-                index_perf_score = float(np.mean(normed)) if normed else 0.5
+            # Normalize MMI using z-score (1D window)
+            all_scores = [float(r[5]) for r in rows_30d if r[5] is not None]
+            if len(all_scores) > 5:
+                mmi_z = float((mmi_raw - np.mean(all_scores)) / (np.std(all_scores) + 1e-6))
+                mmi_norm = float(scipy.stats.norm.cdf(mmi_z))  # percentile
             else:
-                index_perf_score = 0.5
+                mmi_norm = (mmi_raw + 1) / 2
 
-            # --- News: prefer cached sector_news_cache (<24h) else use rows passed in (sentiment_data)
-            news_texts = []
-            cached_news = self.get_sector_news(symbol)
-            if cached_news:
-                for t, d, url, pub in cached_news:
-                    txt = (t or '') + ' ' + (d or '')
-                    if txt.strip():
-                        news_texts.append(txt.strip())
-                logging.info(f"Using {len(news_texts)} cached news items for {symbol}")
-
-            # If no cached news, try to extract from provided 'rows' (sentiment_data)
-            if not news_texts and rows:
-                logging.info(f"No cached news found for {symbol}, checking provided sentiment_data rows")
-                for r in rows:
-                    try:
-                        # support both tuple and dict rows
-                        src = r[2] if isinstance(r, (list, tuple)) else r.get('source')
-                        if src == 'news':
-                            row_symbol = r[4] if isinstance(r, (list, tuple)) else r.get('symbol')
-                            if row_symbol == symbol or symbol == 'market':
-                                text = r[3] if isinstance(r, (list, tuple)) else r.get('text')
-                                if text and len(text.strip()) > 20:
-                                    news_texts.append(text.strip())
-                    except Exception as e:
-                        logging.debug(f"Error processing provided row: {e}")
-                        continue
-                logging.info(f"Found {len(news_texts)} news items from provided sentiment_data for {symbol}")
-
-            if not news_texts:
-                logging.warning(
-                    f"No news found for {symbol}. "
-                    f"The data_loader should have populated sector_news_cache. "
-                    f"MMI will be computed with limited data."
-                )
-
-            # --- Clean and deduplicate texts ---
-            news_texts = helper.deduplicate_texts(news_texts, min_length=20) if news_texts else []
-            if len(news_texts)==0:
-                logging.warning(f"After deduplication no unique news items left")
-            else:
-                logging.info(f"After deduplication: {len(news_texts)} unique news items")
-
-            # --- FinBERT Sentiment Analysis ---
-            news_scores = []
-            if news_texts:
-                try:
-                    from transformers import pipeline
-                    if self.finbert_pipeline is None:
-                        try:
-                            self.finbert_pipeline = helper._load_finbert_model()
-                            logging.info("FinBERT model loaded successfully.")
-                        except Exception as e:
-                            logging.warning(f"FinBERT load failed, using default sentiment model: {e}")
-                            self.finbert_pipeline = pipeline('sentiment-analysis')
-
-                    finbert = self.finbert_pipeline
-
-                    for txt in news_texts:
-                        try:
-                            out = finbert(txt[:1000])[0]
-                            lbl = out.get('label', '').lower()
-                            score = float(out.get('score', 0.0))
-
-                            if 'neg' in lbl:
-                                val = -score
-                            elif 'pos' in lbl:
-                                val = score
-                            else:
-                                val = 0.0
-
-                            news_scores.append(val)
-
-                        except Exception as e:
-                            logging.warning(f"FinBERT failed on text fragment: {e}")
-                            continue
-
-                except Exception as e:
-                    # fallback to sentiment_score present in rows if available
-                    logging.warning(f"FinBERT pipeline unavailable, falling back to stored sentiment_score: {e}")
-                    for r in rows or []:
-                        try:
-                            src = r[2] if isinstance(r, (list, tuple)) else r.get('source')
-                            if src == 'news':
-                                score = r[5] if isinstance(r, (list, tuple)) else r.get('sentiment_score')
-                                if score is not None:
-                                    news_scores.append(float(score))
-                        except Exception:
-                            continue
-
-            # --- Compute final sentiment ---
-            news_sentiment = float(np.mean(news_scores)) if news_scores else 0.0
-            news_sentiment = max(-1.0, min(1.0, news_sentiment))
-            logging.info(f"Final news_sentiment for {symbol}: {news_sentiment:.3f}")
-
-            # --- Trends: prefer cached trends_cache (<24h) else fetch and store via NewsData.io ---
-            bull_terms = ["nifty today", "buy stocks", "stock market india", "buy shares", "RBI interest rates", "long term investment india"]
-            bear_terms = ["sensex crash", "sell stocks", "stock market crash", "inflation india", "sell shares"]
-            trend_sentiment = 0.0
-
-            try:
-                terms = bull_terms + bear_terms
-                values = {}
-
-                # 1) Delete stale cache (>24h)
-                trends_cursor = conn.cursor(buffered=True)
-                try:
-                    trends_cursor.execute("DELETE FROM trends_cache WHERE cached_at < %s", (one_day_ago,))
-                    conn.commit()
-                except Exception as e:
-                    logging.debug(f"Failed to prune trends_cache: {e}")
-
-                # 2) Check cache
-                try:
-                    trends_cursor.execute("SELECT COUNT(*) FROM trends_cache")
-                    count = trends_cursor.fetchone()[0]
-                    table_empty = (count == 0)
-                except Exception as e:
-                    logging.debug(f"Failed to check trends_cache count: {e}")
-                    table_empty = True
-
-                if not table_empty:
-                    for term in terms:
-                        try:
-                            trends_cursor.execute(
-                                "SELECT value, cached_at FROM trends_cache WHERE term=%s AND value IS NOT NULL",
-                                (term,),
-                            )
-                            rowt = trends_cursor.fetchone()
-                            if rowt and float(rowt[1]) >= one_day_ago:
-                                values[term] = float(rowt[0])
-                                logging.info(f"Used stored trend value for {term}: {values[term]}")
-                        except Exception as e:
-                            logging.debug(f"Trend cache lookup failed for {term}: {e}")
-                            continue
-                else:
-                    logging.info("trends_cache is empty or unavailable, fetching fresh data...")
-
-                # 3) Fetch missing terms via NewsData.io sentiment
-                missing_terms = [t for t in terms if t not in values]
-                if missing_terms:
-                    api_key = os.getenv("NEWSDATA_API_KEY")
-                    if not api_key:
-                        logging.warning("Missing NEWSDATA_API_KEY environment variable; skipping trend fetch.")
-                        missing_terms = []
-                    else:
-                        base_url = "https://newsdata.io/api/1/news"
-                        now_ts_local = datetime.datetime.utcnow().timestamp()
-
-                        for kw in missing_terms:
-                            try:
-                                logging.info(f"Fetching news sentiment for: {kw}")
-                                # build params safe (avoid direct string concatenation)
-                                params = {
-                                    "apikey": api_key,
-                                    "q": kw,
-                                    "country": "in",
-                                    "language": "en"
-                                }
-                                session = helper.get_retry_session(retries=3, backoff_factor=2)
-                                resp = session.get(base_url, params=params, timeout=20)
-                                try:
-                                    data = resp.json()
-                                except ValueError:
-                                    logging.warning(f"Invalid JSON from NewsData for keyword {kw}")
-                                    continue
-
-                                articles = data.get("results", [])
-                                if not articles:
-                                    logging.warning(f"NEWSDATA API NOT WORKING FOR: {kw}")
-                                    continue
-
-                                scores = []
-                                for art in articles:
-                                    text = (art.get("title") or "") + " " + (art.get("description") or "")
-                                    if text.strip():
-                                        polarity = TextBlob(text).sentiment.polarity
-                                        scores.append(polarity)
-
-                                avg_score = float(np.mean(scores)) if scores else 0.0
-                                # keep as float precision
-                                normalized_val = (avg_score + 1.0) * 50.0  # -1..1 → 0..100 float
-
-                                try:
-                                    # upsert semantics: REPLACE or INSERT/UPDATE
-                                    trends_cursor.execute(
-                                        "REPLACE INTO trends_cache (term, value, cached_at) VALUES (%s, %s, %s)",
-                                        (kw, normalized_val, now_ts_local)
-                                    )
-                                    conn.commit()
-                                except Exception as e:
-                                    logging.debug(f"Failed to write trend cache for {kw}: {e}")
-                                    try:
-                                        conn.rollback()
-                                    except Exception:
-                                        pass
-
-                                values[kw] = normalized_val
-
-                            except Exception as e:
-                                logging.warning(f"Error fetching news trend for {kw}: {e}")
-                                logging.debug(traceback.format_exc())
-
-                            time.sleep(1)  # keep small delay to be polite with API
-
-                # 4) Compute sentiment from values we have
-                bull_vals = [values[k] / 100.0 for k in bull_terms if k in values]
-                bear_vals = [values[k] / 100.0 for k in bear_terms if k in values]
-                bull_avg = float(np.mean(bull_vals)) if bull_vals else 0.0
-                bear_avg = float(np.mean(bear_vals)) if bear_vals else 0.0
-                trend_sentiment = bull_avg - bear_avg
-                trend_sentiment = max(-1.0, min(1.0, trend_sentiment))
-            except Exception as e:
-                logging.warning(f"NewsData.io trend sentiment failed: {e}")
-                logging.debug(traceback.format_exc())
-                trend_sentiment = 0.0
-            finally:
-                try:
-                    trends_cursor.close()
-                except Exception:
-                    pass
-
-            # user feedback aggregation
-            feedback_sentiment = None
-            if user_feedbacks:
-                try:
-                    cleaned = [max(-1.0, min(1.0, float(x))) for x in user_feedbacks]
-                    feedback_sentiment = float(np.mean(cleaned)) if cleaned else None
-                except Exception as e:
-                    logging.debug(f"user_feedbacks processing failed: {e}")
-                    feedback_sentiment = None
-
-            if feedback_sentiment is not None:
-                user_feedback_score = 0.7 * trend_sentiment + 0.3 * feedback_sentiment
-            else:
-                user_feedback_score = trend_sentiment
-            user_feedback_score = max(-1.0, min(1.0, user_feedback_score))
-
-            # Final MMI calculation (raw values -1..1)
-            final_value = 0.4 * news_sentiment + 0.3 * user_feedback_score + 0.3 * index_perf_score
-            mmi_raw = max(-1.0, min(1.0, final_value))
-            # Scale to 0..100 integer
-            scaled_mmi = int(((mmi_raw + 1) / 2) * 100)
-
+            scaled_mmi = int(mmi_norm * 100)
             if scaled_mmi <= 25:
                 mood = "Extreme Fear"
             elif scaled_mmi <= 50:
@@ -758,33 +502,206 @@ class DatabaseHandler:
             else:
                 mood = "Extreme Greed / Euphoria"
 
+            # ---------------- Explainability & Attribution ----------------
+            def _build_contributors(rows_window, top_n=5):
+                """Identify top positive/negative contributors by sentiment_score."""
+                items = []
+                for r in rows_window:
+                    try:
+                        score = float(r[5]) if r[5] is not None else 0.0
+                    except Exception:
+                        continue
+                    text = (r[3] or "") if isinstance(r, (list, tuple)) else str(r)
+                    ts = r[1] if isinstance(r, (list, tuple)) else None
+                    src = r[2] if isinstance(r, (list, tuple)) else None
+                    items.append({
+                        "timestamp": str(ts),
+                        "source": src or "",
+                        "symbol": symbol,
+                        "sentiment_score": score,
+                        "text": (text or "")[:280],
+                    })
+                positives = sorted(
+                    [i for i in items if i["sentiment_score"] > 0],
+                    key=lambda x: -x["sentiment_score"],
+                )[:top_n]
+                negatives = sorted(
+                    [i for i in items if i["sentiment_score"] < 0],
+                    key=lambda x: x["sentiment_score"],
+                )[:top_n]
+                return {"top_positive": positives, "top_negative": negatives}
+
+            contributors_1d = _build_contributors(rows_1d, top_n=5)
+
+            # Sector-wise sentiment breakdown for this symbol (1D window)
+            def _label_from_row(r):
+                # sentiment_label is at index 10 if present; fall back on score
+                try:
+                    lbl = r[10]
+                except Exception:
+                    lbl = None
+                if lbl:
+                    return str(lbl)
+                try:
+                    s = float(r[5]) if r[5] is not None else 0.0
+                except Exception:
+                    s = 0.0
+                if s > 0.05:
+                    return "positive"
+                if s < -0.05:
+                    return "negative"
+                return "neutral"
+
+            sentiment_counts = {"positive": 0, "negative": 0, "neutral": 0}
+            for r in rows_1d:
+                label = _label_from_row(r)
+                if label in sentiment_counts:
+                    sentiment_counts[label] += 1
+
+            total_labeled = max(
+                1, sum(sentiment_counts.values())
+            )  # avoid divide-by-zero
+            sector_sentiment_breakdown = {
+                "counts": sentiment_counts,
+                "share": {
+                    k: v / total_labeled for k, v in sentiment_counts.items()
+                },
+            }
+
+            # Data freshness: how recent is the latest ingestion for this symbol
+            latest_ingestion = None
+            for r in rows_30d:
+                try:
+                    ts = float(r[9])  # ingestion_ts index
+                except Exception:
+                    continue
+                if latest_ingestion is None or ts > latest_ingestion:
+                    latest_ingestion = ts
+            if latest_ingestion is not None:
+                age_sec = max(0.0, now_ts - latest_ingestion)
+                data_freshness = {
+                    "latest_ingestion_ts": latest_ingestion,
+                    "age_seconds": age_sec,
+                }
+            else:
+                data_freshness = {
+                    "latest_ingestion_ts": None,
+                    "age_seconds": None,
+                }
+
+            # Source-level attribution (relative weights)
+            total_abs = (
+                abs(comp_1d.get("news", 0.0))
+                + abs(comp_1d.get("social", 0.0))
+                + abs(comp_1d.get("other", 0.0))
+            )
+            if total_abs <= 0:
+                source_share = {"news": 0.0, "social": 0.0, "other": 0.0}
+            else:
+                source_share = {
+                    k: abs(v) / total_abs for k, v in comp_1d.items()
+                }
+
+            # Delta vs previous MMI if available
+            delta_info = None
+            if existing and isinstance(existing.get("detail"), str):
+                try:
+                    prev_detail = json.loads(existing["detail"] or "{}")
+                    prev_mmi = float(prev_detail.get("scaled_mmi", existing["mmi"]))
+                    prev_comp = prev_detail.get("component_1d", {})
+                    delta_info = {
+                        "prev_mmi": prev_mmi,
+                        "delta_mmi": scaled_mmi - prev_mmi,
+                        "delta_components": {
+                            src: comp_1d.get(src, 0.0)
+                            - float(prev_comp.get(src, 0.0))
+                            for src in ("news", "social", "other")
+                        },
+                    }
+                except Exception as e:
+                    logging.debug(
+                        f"Failed to parse previous MMI detail for {symbol}: {e}"
+                    )
+
+            # Human-readable explanation summarizing main drivers
+            def _summarize_drivers():
+                pos = contributors_1d["top_positive"]
+                neg = contributors_1d["top_negative"]
+                parts = []
+                if delta_info:
+                    dm = delta_info.get("delta_mmi")
+                    if dm is not None:
+                        if dm > 0:
+                            parts.append(
+                                f"MMI moved up by {dm:.1f} points driven mainly by improving sentiment."
+                            )
+                        elif dm < 0:
+                            parts.append(
+                                f"MMI declined by {abs(dm):.1f} points due to rising negative sentiment."
+                            )
+                if pos:
+                    parts.append(
+                        f"Positive tone is supported by headlines such as: "
+                        + "; ".join(p["text"] for p in pos[:3])
+                    )
+                if neg:
+                    parts.append(
+                        f"Negative pressure comes from headlines like: "
+                        + "; ".join(n["text"] for n in neg[:3])
+                    )
+                if not parts:
+                    parts.append(
+                        "Sentiment is mixed with no single dominant driver in the latest window."
+                    )
+                return " ".join(parts)
+
+            news_summary = _summarize_drivers()
+
             detail = json.dumps({
-                'news_sentiment': float(news_sentiment),
-                'trend_sentiment': float(trend_sentiment),
-                'user_feedback_sentiment': float(user_feedback_score),
-                'index_perf_score': float(index_perf_score),
-                'index_changes': [float(x) for x in index_changes],
-                'index_map': {k: float(v) for k, v in index_map.items()},
-                'weights': {'news': 0.4, 'user_feedback': 0.3, 'indices': 0.3},
-                'final_value_raw': float(final_value),
+                'mmi_1d': mmi_raw,
+                'mmi_7d': mmi_7d,
+                'mmi_30d': mmi_30d,
+                'component_1d': comp_1d,
+                'component_7d': comp_7d,
+                'component_30d': comp_30d,
+                'mmi_norm': mmi_norm,
                 'scaled_mmi': scaled_mmi,
-                'symbol': symbol
+                'symbol': symbol,
+                'contributors_1d': contributors_1d,
+                'sector_sentiment_breakdown': sector_sentiment_breakdown,
+                'data_freshness': data_freshness,
+                'source_share_1d': source_share,
+                'delta_info': delta_info,
             })
             last_update = now_ts
 
             # commit MMI to DB
             mmi_cursor = conn.cursor(buffered=True)
             try:
+                # Upsert latest MMI into cache
                 if self.get_mmi_for_topic(symbol):
-                    mmi_cursor.execute("UPDATE mmi_cache SET mmi=%s, mood=%s, detail=%s, last_update=%s WHERE symbol=%s",
-                                   (scaled_mmi, mood, detail, last_update, symbol))
+                    mmi_cursor.execute(
+                        "UPDATE mmi_cache SET mmi=%s, mood=%s, detail=%s, last_update=%s, news_summary=%s WHERE symbol=%s",
+                        (scaled_mmi, mood, detail, last_update, news_summary, symbol),
+                    )
                 else:
                     mmi_cursor.execute(
-                        "INSERT INTO mmi_cache (symbol, mmi, mood, detail, last_update) VALUES (%s, %s, %s, %s, %s)",
-                        (symbol, scaled_mmi, mood, detail, last_update))
+                        "INSERT INTO mmi_cache (symbol, mmi, mood, detail, last_update, news_summary) VALUES (%s, %s, %s, %s, %s, %s)",
+                        (symbol, scaled_mmi, mood, detail, last_update, news_summary),
+                    )
+                # Also persist a daily snapshot into mmi_history (as_of = start of UTC day)
+                as_of_day = (int(now_ts) // 86400) * 86400
+                mmi_cursor.execute(
+                    "INSERT INTO mmi_history (symbol, mmi, as_of) VALUES (%s, %s, %s) "
+                    "ON DUPLICATE KEY UPDATE mmi=%s",
+                    (symbol, scaled_mmi, as_of_day, scaled_mmi),
+                )
                 conn.commit()
             except Exception as e:
-                logging.warning(f"Failed to write mmi_cache for {symbol}: {e}")
+                logging.warning(
+                    f"Failed to write mmi_cache for {symbol}: {e}",
+                    extra={"error_category": "database", "symbol": symbol},
+                )
                 try:
                     conn.rollback()
                 except Exception:
@@ -811,9 +728,39 @@ class DatabaseHandler:
         conn = self._get_connection()
         cursor = conn.cursor(buffered=True)
         try:
+            # Check for duplicate using content_hash if present
+            content_hash = data.get('content_hash')
+            if content_hash:
+                cursor.execute("SELECT COUNT(*) FROM sentiment_data WHERE symbol=%s AND timestamp=%s AND MD5(text) = MD5(%s)", (data['symbol'], data['timestamp'], data['text']))
+                if cursor.fetchone()[0] > 0:
+                    logging.info(f"Duplicate entry skipped for {data['symbol']} at {data['timestamp']}")
+                    return
+            # Store both raw and cleaned text if available
+            cleaned_text = data.get('cleaned_text', data['text'])
+            # Add columns if not exist (idempotent)
+            try:
+                cursor.execute("ALTER TABLE sentiment_data ADD COLUMN cleaned_text TEXT")
+            except Exception:
+                pass
+            try:
+                cursor.execute("ALTER TABLE sentiment_data ADD COLUMN sector VARCHAR(64)")
+            except Exception:
+                pass
+            try:
+                cursor.execute("ALTER TABLE sentiment_data ADD COLUMN ingestion_ts DOUBLE")
+            except Exception:
+                pass
+            try:
+                cursor.execute("ALTER TABLE sentiment_data ADD COLUMN sentiment_label VARCHAR(32)")
+            except Exception:
+                pass
+            try:
+                cursor.execute("ALTER TABLE sentiment_data ADD COLUMN sentiment_confidence FLOAT")
+            except Exception:
+                pass
             cursor.execute(
-                "INSERT INTO sentiment_data (timestamp, source, text, symbol, sentiment_score, emotion) VALUES (%s, %s, %s, %s, %s, %s)",
-                (data['timestamp'], data['source'], data['text'], data['symbol'], data['sentiment_score'], data['emotion'])
+                "INSERT INTO sentiment_data (timestamp, source, text, cleaned_text, symbol, sentiment_score, sentiment_label, sentiment_confidence, emotion, sector, ingestion_ts) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                (data['timestamp'], data['source'], data['text'], cleaned_text, data['symbol'], data['sentiment_score'], data.get('sentiment_label'), data.get('sentiment_confidence'), data['emotion'], data.get('sector'), data.get('ingestion_ts'))
             )
             conn.commit()
         except Exception as e:
@@ -831,5 +778,25 @@ class DatabaseHandler:
             cursor.execute("SELECT * FROM sentiment_data ORDER BY timestamp DESC LIMIT %s", (limit,))
             rows = cursor.fetchall()
             return rows
+        finally:
+            cursor.close()
+
+    def get_mmi_history(self, symbol: str, days: int):
+        """
+        Fetch historical MMI snapshots for a symbol over the last `days` days.
+        Returns list of (as_of, mmi) tuples ordered by as_of ascending.
+        """
+        cursor = self._get_cursor()
+        try:
+            now_ts = datetime.datetime.utcnow().timestamp()
+            cutoff = now_ts - days * 86400
+            cursor.execute(
+                "SELECT as_of, mmi FROM mmi_history WHERE symbol=%s AND as_of >= %s ORDER BY as_of ASC",
+                (symbol, cutoff),
+            )
+            return cursor.fetchall()
+        except Exception as e:
+            logging.warning(f"get_mmi_history failed for {symbol}: {e}")
+            return []
         finally:
             cursor.close()

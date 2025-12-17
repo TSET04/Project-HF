@@ -2,28 +2,24 @@ import os
 from dotenv import load_dotenv
 import time
 import logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+from typing import Iterable
+
+from utils.helper import setup_logging
 from utils.db import DatabaseHandler
 from dashboard.app import run_dashboard
 from utils.data_loader import start_streams
+from config import SECTOR_MAP, INDICES
 
-# ---------- Global Sector Configuration (single source of truth) ----------
-SECTOR_DISPLAY = ['Banking','IT','Pharma','FMCG','Auto']
-SECTOR_DB_KEYS = ['banking','information technology','pharma','fmcg','auto']
-indices = [
-                ('^NSEI', 'NIFTY 50'),
-                ('^BSESN', 'BSE SENSEX'),
-                ('^NSEBANK', 'NIFTY BANK'),
-                ('^CNXIT', 'NIFTY IT'),
-                ('^CNXFMCG', 'NIFTY FMCG')
-                ]
-SECTOR_MAP = dict(zip(SECTOR_DISPLAY, SECTOR_DB_KEYS))
-# -------------------------------------------------------------------------
+def initialize_mmi_cache(db: DatabaseHandler, limit: int = 1000) -> None:
+    """
+    Warm up the MMI cache and AI feedback for all symbols seen
+    in the most recent sentiment entries.
 
-def initialize_mmi_cache(db):
+    This is idempotent and safe to call at startup.
+    """
     logging.info("Initializing MMI cache from recent DB entries...")
-    all_rows = db.fetch_recent_entries(1000)
-    symbols = set([row[4] if isinstance(row, (list, tuple)) else row['symbol'] for row in all_rows])
+    all_rows = db.fetch_recent_entries(limit)
+    symbols = {row[4] if isinstance(row, (list, tuple)) else row["symbol"] for row in all_rows}
     for sym in symbols:
         rec = db.get_mmi_for_topic(sym)
         df_topic = [row for row in all_rows if (row[4] if isinstance(row, (list, tuple)) else row['symbol'])==sym]
@@ -48,15 +44,28 @@ def initialize_mmi_cache(db):
 
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), '.env'))
 
-def main():
-    logging.info("Starting main()")
-    db = DatabaseHandler(indices)
-    logging.info('DatabaseHandler initialized')
+def main(indices: Iterable[tuple[str, str]] = INDICES) -> None:
+    """
+    Entry point for the Market-Mood AI system.
+
+    - Sets up structured JSON logging
+    - Initializes DB schema and MMI cache
+    - Starts background ingestion / MMI update loop
+    - Runs the Streamlit dashboard
+    """
+    # Initialize structured logging once at process start
+    setup_logging()
+    logging.info("Starting main()", extra={"pipeline_step": "startup"})
+    db = DatabaseHandler(list(indices))
+    logging.info('DatabaseHandler initialized', extra={"pipeline_step": "startup"})
     initialize_mmi_cache(db)
-    logging.info('MMI cache initialized')
+    logging.info('MMI cache initialized', extra={"pipeline_step": "startup"})
     # Start background collector (idempotent)
-    start_streams(sector_map = SECTOR_MAP, indices=indices)
-    logging.info('Data stream collection requested (start_streams)')
+    start_streams(sector_map=SECTOR_MAP, indices=list(indices))
+    logging.info(
+        'Data stream collection requested (start_streams)',
+        extra={"pipeline_step": "startup"}
+    )
     run_dashboard(db=db, sector_map=SECTOR_MAP)
 
 if __name__ == "__main__":
