@@ -1,2 +1,4 @@
 .env
 market_mood/
+__pycache__/
+*.pyc
