@@ -9,7 +9,7 @@ class FinBertSentimentAnalyzer:
         self.label_map = {0: 'negative', 1: 'neutral', 2: 'positive'}
 
     def predict(self, text):
-        inputs = self.tokenizer(text, return_tensors="pt", truncation=True, padding=True)
+        inputs = self.tokenizer(text, return_tensors="pt", max_length=512, truncation=True, padding=True)
         outputs = self.model(**inputs)
         probs = torch.nn.functional.softmax(outputs.logits, dim=1).detach().numpy()[0]
         sentiment_score = probs[2] - probs[0] # positive - negative

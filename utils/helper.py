@@ -8,16 +8,16 @@ from transformers import pipeline
 
 class helper:
     def __init__(self):
-        self.parse_perplexity_response()
+        self.parse_mistral_response()
         self.deduplicate_texts()
         self.get_retry_session()
         
-    def parse_perplexity_response(response_data):
+    def parse_mistral_response(response_data):
         """
-        Safely parse Perplexity API response with multiple fallback strategies.
+        Safely parse mistral API response with multiple fallback strategies.
         
         Args:
-            response_data: JSON response from Perplexity API
+            response_data: JSON response from mistral API
         
         Returns:
             Extracted text content or error message
@@ -47,11 +47,11 @@ class helper:
                     return result.strip()
             
             # No valid content found
-            logging.warning(f"Unexpected Perplexity response structure: {list(response_data.keys())}")
+            logging.warning(f"Unexpected mistral response structure: {list(response_data.keys())}")
             return "No response text available"
             
         except Exception as e:
-            logging.error(f"Error parsing Perplexity response: {e}")
+            logging.error(f"Error parsing mistral response: {e}")
             return f"Response parsing error: {str(e)}"
 
     def deduplicate_texts(texts, min_length=20):

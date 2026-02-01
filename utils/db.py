@@ -226,12 +226,12 @@ class DatabaseHandler:
 
     def generate_and_store_ai_feedback(self, symbol, mmi_value: int):
         """
-        Generate Perplexity-based (or fallback) feedback for the given symbol and MMI value,
+        Generate Mistral-based (or fallback) feedback for the given symbol and MMI value,
         store it in ai_feedback_cache and return the feedback string.
 
         Note: this code treats MMI range as -100..100 and mentions that in the prompt.
         """
-        api_key = os.environ.get('PERPLEXITY_API_KEY')
+        api_key = os.environ.get('MISTRAL_API_KEY')
         # deterministic label (based on -100..100)
         label = 'Neutral'
         if mmi_value <= -40:
@@ -249,6 +249,7 @@ class DatabaseHandler:
                 return f"Neutral — The MMI is {mmi_value}, market mood appears balanced; wait for clearer signals."
 
         if not api_key:
+            logging.warning("MISTRAL_API_KEY not found, using fallback AI feedback.")
             fb = fallback_msg(label, mmi_value)
             try:
                 self.store_ai_feedback(symbol, fb)
@@ -256,30 +257,44 @@ class DatabaseHandler:
                 logging.debug(f"Failed to store fallback ai feedback: {e}")
             return fb
 
-        # call Perplexity
+        # call Mistral
         try:
             prompt = (
-                f"You are an unbiased financial assistant. Given only the Market Mood Index (MMI) value {mmi_value} "
-                f"(range -100 to 100), give factual feedback on whether the user should buy, sell, or stay calm. "
-                f"Also, state if the market mood is bullish, bearish, or neutral based purely on MMI statistics. "
-                f"Keep it concise, easy to understand language, and free of bias. Do not repeat the obvious MMI number and information. "
-                f"Avoid giving numbers in square brackets in your response."
+            "You are an unbiased financial assistant.\n\n"
+            "Context:\n"
+            "The Market Mood Index (MMI) is a composite sentiment indicator that summarizes overall market psychology "
+            "using multiple signals such as trend strength, volatility, participation, momentum, and risk appetite. "
+            "It does NOT predict price, but reflects whether the market is emotionally overheated, fearful, or balanced.\n\n"
+            "Interpretation rules:\n"
+            "- Low MMI implies fear, risk-off behavior, and bearish market mood.\n"
+            "- Mid-range MMI implies balance, uncertainty, or neutral market mood.\n"
+            "- High MMI implies optimism, risk-on behavior, and bullish market mood.\n\n"
+            "Task:\n"
+            f"Given only the current MMI value ({mmi_value}) on a scale from 0 to 100, "
+            "provide factual, sentiment-based guidance on whether the user should buy, sell, or stay calm. "
+            "Also classify the market mood as bullish, bearish, or neutral based purely on sentiment interpretation.\n\n"
+            "Constraints:\n"
+            "- Do NOT repeat the MMI value or explain the scale.\n"
+            "- Do NOT make price predictions or guarantees.\n"
+            "- Keep the response concise, neutral, and easy to understand.\n"
+            "- Avoid numbers in square brackets.\n"
             )
 
-            url = "https://api.perplexity.ai/chat/completions"
+
+            url = "https://api.mistral.ai/v1/chat/completions"
             headers = {
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
             }
 
             data = {
-                "model": "sonar-pro", 
+                "model": "mistral-large-latest", 
                 "messages": [{"role": "user", "content": prompt}],
                 "temperature": 0.0,
                 "max_tokens": 120,
             }
 
-            logging.info(f"Calling Perplexity for symbol={symbol} mmi={mmi_value}")
+            logging.info(f"Calling Mistral for symbol={symbol} mmi={mmi_value}")
             session = helper.get_retry_session(retries=2, backoff_factor=1.5)
             resp = session.post(url, headers=headers, json=data, timeout=15)
             resp.raise_for_status()
@@ -287,11 +302,10 @@ class DatabaseHandler:
             try:
                 result = resp.json()
             except ValueError:
-                logging.warning("Perplexity returned non-JSON response")
-                raise RuntimeError("Invalid JSON from Perplexity")
-
-            logging.debug(f"Perplexity response raw: {result}")
-            result_text = helper.parse_perplexity_response(result) if hasattr(helper, "parse_perplexity_response") else str(result)
+                logging.warning("Mistral returned non-JSON response")
+                raise RuntimeError("Invalid JSON from Mistral")
+            logging.debug(f"Mistral response raw: {result}")
+            result_text = helper.parse_mistral_response(result) if hasattr(helper, "parse_mistral_response") else str(result)
 
             # Clean up response
             lines = [l.strip() for l in result_text.split("\n") if l.strip()]
@@ -303,10 +317,10 @@ class DatabaseHandler:
             # Additional cleanup: remove markdown, citations, etc.
             fb = fb.replace("**", "").replace("[", "").replace("]", "")
             fb = ' '.join(fb.split())
-            logging.info(f"Perplexity produced feedback for {symbol}: {fb}")
+            logging.info(f"Mistral produced feedback for {symbol}: {fb}")
 
         except Exception as e:
-            logging.warning(f'Perplexity API call failed for {symbol}: {e}')
+            logging.warning(f'Mistral API call failed for {symbol}: {e}')
             logging.debug(traceback.format_exc())
             fb = fallback_msg(label, mmi_value)
 
@@ -385,27 +399,11 @@ class DatabaseHandler:
         """
         logging.info(f'Recomputing/storing MMI for topic: {symbol}')
         conn = self._get_connection()
-        lock_cursor = conn.cursor(buffered=True)
-        lock_name = f"mmi_{symbol}"
-        lock_acquired = False
         now_ts = datetime.datetime.utcnow().timestamp()
 
         try:
-            # Acquire advisory lock for this symbol (timeout 10s)
-            try:
-                lock_cursor.execute("SELECT GET_LOCK(%s, %s)", (lock_name, 10))
-                res = lock_cursor.fetchone()
-                lock_acquired = bool(res and res[0] == 1)
-            except Exception as e:
-                logging.warning(f"GET_LOCK failed for {symbol}: {e}")
-                lock_acquired = False
-
-            if not lock_acquired:
-                logging.warning(f"Could not acquire lock for {symbol}, using cached value if available")
-                existing = self.get_mmi_for_topic(symbol)
-                return existing['mmi'] if existing else 0
-
-            # After acquiring lock, re-check cached MMI freshness
+            # Re-check cached MMI freshness
+            # Skip computation if fresh cache exists
             existing = self.get_mmi_for_topic(symbol)
             one_day_ago = now_ts - 86400
             if existing and existing.get('last_update') and float(existing.get('last_update')) >= one_day_ago:
@@ -464,7 +462,7 @@ class DatabaseHandler:
                 try:
                     for code in missing:
                         try:
-                            data = yf.download(code, period='2d', interval='1d', progress=False)
+                            data = yf.download(code, period='2d', interval='1d', progress=False, auto_adjust=False)
                             if data is not None and not data.empty and len(data['Close'].values) >= 2:
                                 pct = (data['Close'].values[-1] - data['Close'].values[-2]) / float(data['Close'].values[-2])
                                 index_changes.append(float(pct))
@@ -791,18 +789,12 @@ class DatabaseHandler:
 
             return scaled_mmi
 
-        finally:
-            # Always release the advisory lock if we acquired it
-            try:
-                if lock_acquired:
-                    lock_cursor.execute("SELECT RELEASE_LOCK(%s)", (lock_name,))
-                    # not checking return value, but log if needed
-            except Exception as e:
-                logging.error(f"Failed to release lock for {symbol}: {e}")
-            try:
-                lock_cursor.close()
-            except Exception:
-                pass
+        except Exception as e:
+            logging.error(f"recompute_and_store_mmi failed for {symbol}: {e}")
+            logging.debug(traceback.format_exc())
+            # Return existing or 0 on failure
+            existing = self.get_mmi_for_topic(symbol)
+            return existing['mmi'] if existing else 0
 
     def insert_entry(self, data):
         conn = self._get_connection()
