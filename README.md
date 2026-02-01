@@ -453,3 +453,5 @@ self.timing_config = {
 - **Shutdown**: Graceful termination with thread cleanup
 
 ---
+
+## NOTE: SOON A DIFFERENT AND A BETTER WORKFLOW IMPLEMENTATION WILL BE RELEASED 😊
